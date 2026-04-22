@@ -1,0 +1,104 @@
+# =============================================================================
+# docker-compose.yml — dovi-converter + Radarr + Sonarr
+#
+# This is an example compose file showing how dovi-converter integrates
+# alongside Radarr and Sonarr. Adapt paths and settings to your environment.
+#
+# Key concepts:
+#   - dovi-converter polls a shared queue directory for new conversion jobs
+#   - Radarr and Sonarr write job files to that queue via enqueue_dovi.sh
+#   - All three containers mount the same media directories
+# =============================================================================
+
+services:
+
+  # ── dovi-converter ──────────────────────────────────────────────────────────
+  dovi-converter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Or use a pre-built image:
+    # image: dovi-converter:latest
+    container_name: dovi-converter
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+
+      # ── Notifications ────────────────────────────────────────────────────
+      # Set NOTIFY_SERVICE to: ntfy | gotify | telegram | discord | email | apprise
+      # Leave unset or blank to disable notifications entirely.
+      #
+      # - NOTIFY_SERVICE=ntfy
+      # - NTFY_URL=https://ntfy.your-server.com/your-topic
+      # - NTFY_AUTH=bearer
+      # - NTFY_TOKEN=your_token
+      #
+      # - NOTIFY_SERVICE=gotify
+      # - GOTIFY_URL=https://gotify.your-server.com
+      # - GOTIFY_TOKEN=your_app_token
+      #
+      # - NOTIFY_SERVICE=telegram
+      # - TELEGRAM_BOT_TOKEN=123456:ABCdef...
+      # - TELEGRAM_CHAT_ID=your_chat_id
+      #
+      # - NOTIFY_SERVICE=discord
+      # - DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
+      #
+      # - NOTIFY_SERVICE=email
+      # - SMTP_HOST=smtp.gmail.com
+      # - SMTP_PORT=465
+      # - SMTP_USER=you@gmail.com
+      # - SMTP_PASS=your_app_password
+      # - SMTP_FROM=you@gmail.com
+      # - SMTP_TO=recipient@example.com
+      #
+      # - NOTIFY_SERVICE=apprise
+      # - APPRISE_URL=http://apprise.your-server.com
+      # - APPRISE_TOKEN=your_token
+
+    volumes:
+      # Scripts directory — place dovi_tool binary here before starting
+      - /path/to/config/dovi-converter/scripts:/scripts
+      # Shared queue — Radarr/Sonarr write job files here
+      - /path/to/config/dovi-converter/queue:/home/queue
+      # Media directories — adjust to match your setup
+      - /path/to/media/Movies:/home/imports/movies
+      - /path/to/media/Shows:/home/imports/shows
+    restart: unless-stopped
+
+  # ── Radarr ──────────────────────────────────────────────────────────────────
+  radarr:
+    image: linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+    volumes:
+      - /path/to/config/radarr:/config
+      - /path/to/media/downloads/movies:/home/downloads/movies
+      - /path/to/media/Movies:/home/imports
+      # Shared queue — dovi-converter polls this for new jobs
+      - /path/to/config/dovi-converter/queue:/home/queue
+    ports:
+      - 7878:7878
+    restart: unless-stopped
+
+  # ── Sonarr ──────────────────────────────────────────────────────────────────
+  sonarr:
+    image: linuxserver/sonarr:latest
+    container_name: sonarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+    volumes:
+      - /path/to/config/sonarr:/config
+      - /path/to/media/downloads/shows:/home/downloads/shows
+      - /path/to/media/Shows:/home/imports
+      # Shared queue — dovi-converter polls this for new jobs
+      - /path/to/config/dovi-converter/queue:/home/queue
+    ports:
+      - 8989:8989
+    restart: unless-stopped
