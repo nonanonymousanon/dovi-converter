@@ -180,7 +180,8 @@ tail -f /path/to/config/dovi-converter/scripts/converter.log
 ```
 
 Sample log output during conversion:
-```
+
+```text
 [2026-04-22 12:00:21]   DoVi detected: Ballerina.2025.2160p.UHD.Blu-ray.Remux.DV.HDR.mkv
 [2026-04-22 12:00:21]   File duration: 02:04:39
 [2026-04-22 12:00:21]   Stripping Dolby Vision layer...
