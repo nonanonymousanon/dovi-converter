@@ -28,8 +28,28 @@ readonly QUEUE_DIR="/scripts/queue"
 readonly SCAN_MARKER="/scripts/.initial_scan_done"
 readonly CHECKPOINT_FILE="/scripts/.scan_checkpoint"
 readonly BLOCKLIST="/scripts/blocklist.txt"
-readonly MEDIA_DIRS=("/home/imports/movies" "/home/imports/shows")
-readonly POLL_INTERVAL=10  # seconds between queue checks
+readonly IMPORTS_ROOT="/home/imports"
+
+# ── tunable settings (override via environment variables) ─────────────────────
+#
+# POLL_INTERVAL   — seconds between queue checks (default: 10)
+#                   Lower values mean faster response to new imports;
+#                   higher values reduce idle CPU/NAS load.
+#                   Example: POLL_INTERVAL=30
+#
+# RESCAN_INTERVAL — how often to run a full library rescan (default: disabled)
+#                   Catches any files that slipped past the queue hook.
+#                   Accepts: a number of hours, e.g. RESCAN_INTERVAL=24
+#                   Set to 0 or leave unset to disable periodic rescans.
+#
+# MEDIA_DIRS      — space-separated list of directories to scan and watch.
+#                   Defaults to auto-discovering all subdirectories under
+#                   /home/imports, so simply bind any directory there and
+#                   it will be picked up automatically.
+#                   Override example: MEDIA_DIRS="/home/imports/movies /home/imports/4k"
+#
+POLL_INTERVAL="${POLL_INTERVAL:-10}"
+RESCAN_INTERVAL="${RESCAN_INTERVAL:-0}"  # hours; 0 = disabled
 
 # ── notification configuration ────────────────────────────────────────────────
 # Configure via environment variables in docker-compose.yml.
@@ -205,17 +225,19 @@ EOF
                 log_err "Apprise: APPRISE_URL must be set."
                 return 0
             }
-            local apprise_auth=""
-            [[ -n "$APPRISE_TOKEN" ]] && apprise_auth="-H \"Authorization: Bearer ${APPRISE_TOKEN}\""
             # Map priority to Apprise priority (min/low/normal/high/max)
             local apprise_priority="normal"
             [[ "$priority" == "low" ]]  && apprise_priority="low"
             [[ "$priority" == "high" ]] && apprise_priority="high"
-            curl -fsS -m 10 \
-                ${apprise_auth:+-H "$APPRISE_TOKEN"} \
-                -H "Content-Type: application/json" \
-                -d "{\"title\":\"${title}\",\"body\":\"${message}\",\"type\":\"${apprise_priority}\"}" \
-                "${APPRISE_URL%/}/notify" > /dev/null 2>&1 \
+            # Build curl args as an array so auth header quoting is handled correctly
+            local curl_args=(-fsS -m 10)
+            [[ -n "$APPRISE_TOKEN" ]] && curl_args+=(-H "Authorization: Bearer ${APPRISE_TOKEN}")
+            curl_args+=(
+                -H "Content-Type: application/json"
+                -d "{\"title\":\"${title}\",\"body\":\"${message}\",\"type\":\"${apprise_priority}\"}"
+                "${APPRISE_URL%/}/notify"
+            )
+            curl "${curl_args[@]}" > /dev/null 2>&1 \
                 || log_err "Apprise notification failed (curl exit $?)."
             ;;
 
@@ -283,12 +305,35 @@ get_duration() {
         | grep -o '^[0-9.]*'
 }
 
+# ── media directory discovery ────────────────────────────────────────────────
+# Returns the list of directories to scan, one per line.
+# Uses MEDIA_DIRS env var if set (space-separated), otherwise auto-discovers
+# all immediate subdirectories of IMPORTS_ROOT (/home/imports).
+# This means any path bound under /home/imports is picked up automatically
+# without needing to reconfigure the script.
+get_media_dirs() {
+    if [[ -n "${MEDIA_DIRS:-}" ]]; then
+        # User explicitly set MEDIA_DIRS — split on whitespace
+        local dir
+        for dir in $MEDIA_DIRS; do
+            echo "$dir"
+        done
+    else
+        # Auto-discover: every immediate subdirectory of /home/imports
+        if [[ ! -d "$IMPORTS_ROOT" ]]; then
+            log_err "Imports root not found: $IMPORTS_ROOT — no directories to scan."
+            return 1
+        fi
+        find "$IMPORTS_ROOT" -mindepth 1 -maxdepth 1 -type d | sort
+    fi
+}
+
 # ── orphaned tmp dir cleanup ──────────────────────────────────────────────────
 cleanup_orphaned_tmpdirs() {
     log "Checking for orphaned temp directories..."
     local count=0
     local media_dir tmpdir
-    for media_dir in "${MEDIA_DIRS[@]}"; do
+    while IFS= read -r media_dir; do
         [[ -d "$media_dir" ]] || continue
         while IFS= read -r -d '' tmpdir; do
             log "  Removing orphaned tmp dir: $tmpdir"
@@ -296,7 +341,7 @@ cleanup_orphaned_tmpdirs() {
             (( count++ )) || true
         done < <(find "$media_dir" -mindepth 2 -maxdepth 2 \
             -type d -name ".dovi_tmp_*" -print0 2>/dev/null)
-    done
+    done < <(get_media_dirs)
     if [[ $count -gt 0 ]]; then
         log "  Cleaned up $count orphaned tmp director(ies)."
     else
@@ -553,7 +598,7 @@ initial_scan() {
         log "INITIAL LIBRARY SCAN STARTING"
         log "  Scanning directories:"
         local d
-        for d in "${MEDIA_DIRS[@]}"; do log "    $d"; done
+        while IFS= read -r d; do log "    $d"; done < <(get_media_dirs)
         log "════════════════════════════════════════════════════"
     fi
 
@@ -562,7 +607,7 @@ initial_scan() {
     [[ -n "$checkpoint" ]] && resuming=true
 
     local media_dir file
-    for media_dir in "${MEDIA_DIRS[@]}"; do
+    while IFS= read -r media_dir; do
         if [[ ! -d "$media_dir" ]]; then
             log_err "Media directory not found: $media_dir — skipping."
             continue
@@ -589,7 +634,7 @@ initial_scan() {
             ! -name "*.part.mkv" \
             ! -name "*.new" \
             -print0 | sort -z)
-    done
+    done < <(get_media_dirs)
 
     log "════════════════════════════════════════════════════"
     log "LIBRARY SCAN COMPLETE — $total file(s) checked this run"
@@ -601,15 +646,24 @@ initial_scan() {
 
 # ── queue polling loop ────────────────────────────────────────────────────────
 poll_queue() {
+    local rescan_secs=0
+    if [[ "${RESCAN_INTERVAL:-0}" -gt 0 ]] 2>/dev/null; then
+        rescan_secs=$(( RESCAN_INTERVAL * 3600 ))
+        log "Periodic rescan enabled — every ${RESCAN_INTERVAL}h"
+    fi
+
     log "════════════════════════════════════════════════════"
     log "POLLING QUEUE — checking every ${POLL_INTERVAL}s"
+    [[ $rescan_secs -gt 0 ]] && log "  Full rescan every ${RESCAN_INTERVAL}h"
     log "  Queue: $QUEUE_DIR"
     log "════════════════════════════════════════════════════"
 
     mkdir -p "$QUEUE_DIR"
 
+    local last_rescan; last_rescan=$(date +%s)
     local job_file file_path
     while true; do
+        # Process any queued import jobs
         for job_file in "$QUEUE_DIR"/*.job; do
             [[ -f "$job_file" ]] || continue
 
@@ -634,6 +688,22 @@ poll_queue() {
             process_file "$file_path"
         done
 
+        # Check if a periodic full rescan is due
+        if [[ $rescan_secs -gt 0 ]]; then
+            local now elapsed
+            now=$(date +%s)
+            elapsed=$(( now - last_rescan ))
+            if (( elapsed >= rescan_secs )); then
+                log "════════════════════════════════════════════════════"
+                log "PERIODIC RESCAN TRIGGERED (interval: ${RESCAN_INTERVAL}h)"
+                log "════════════════════════════════════════════════════"
+                rm -f "$SCAN_MARKER"
+                clear_checkpoint
+                initial_scan
+                last_rescan=$(date +%s)
+            fi
+        fi
+
         sleep "$POLL_INTERVAL"
     done
 }
@@ -644,6 +714,17 @@ main() {
 
     log "════════════════════════════════════════════════════"
     log "dovi-converter starting up"
+    log "  Poll interval   : ${POLL_INTERVAL}s"
+    if [[ "${RESCAN_INTERVAL:-0}" -gt 0 ]] 2>/dev/null; then
+        log "  Rescan interval : every ${RESCAN_INTERVAL}h"
+    else
+        log "  Rescan interval : disabled"
+    fi
+    if [[ -n "${MEDIA_DIRS:-}" ]]; then
+        log "  Media dirs      : ${MEDIA_DIRS} (from MEDIA_DIRS env var)"
+    else
+        log "  Media dirs      : auto-discover under ${IMPORTS_ROOT}"
+    fi
     log "════════════════════════════════════════════════════"
 
     check_deps
@@ -654,10 +735,10 @@ main() {
     else
         log "Initial scan already completed — entering queue polling mode."
         local media_dir
-        for media_dir in "${MEDIA_DIRS[@]}"; do
+        while IFS= read -r media_dir; do
             [[ -d "$media_dir" ]] || continue
             find "$media_dir" -name "*.new" -type f -delete 2>/dev/null || true
-        done
+        done < <(get_media_dirs)
     fi
 
     poll_queue

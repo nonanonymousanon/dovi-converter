@@ -176,7 +176,6 @@ main() {
     info "Found ${#files[@]} MKV file(s) to evaluate."
 
     local processed=0
-    local skipped=0
     local failed=0
 
     for f in "${files[@]}"; do
