@@ -93,8 +93,19 @@ Click **Test** to verify the connection.
 |---|---|
 | `/scripts` | Scripts directory — place `dovi_tool` binary here |
 | `/home/queue` | Shared job queue — Radarr/Sonarr write `.job` files here |
-| `/home/imports/movies` | Movies library |
-| `/home/imports/shows` | TV shows library |
+| `/home/imports/*` | Any subdirectory bound here is scanned automatically |
+
+You can bind as many media directories as you like under `/home/imports`:
+
+```yaml
+volumes:
+  - /path/to/media/Movies:/home/imports/movies
+  - /path/to/media/Shows:/home/imports/shows
+  - /path/to/media/4K:/home/imports/4k
+  - /path/to/media/Anime:/home/imports/anime
+```
+
+All of them will be discovered and scanned without any additional configuration.
 
 ## Environment variables
 
@@ -104,6 +115,13 @@ Click **Test** to verify the connection.
 | `PUID` | User ID to run as |
 | `PGID` | Group ID to run as |
 | `TZ` | Timezone (e.g. `America/New_York`) |
+
+### Tunable settings (optional)
+| Variable | Default | Description |
+|---|---|---|
+| `POLL_INTERVAL` | `10` | Seconds between queue checks. Lower = faster response to new imports; higher = less idle load. |
+| `RESCAN_INTERVAL` | `0` (disabled) | Hours between automatic full library rescans. Useful as a safety net to catch files that slipped past the queue hook. Set to `0` to disable. |
+| `MEDIA_DIRS` | auto-discover | Space-separated list of directories to scan. By default, every subdirectory mounted under `/home/imports` is discovered automatically — just bind your directories there and they are picked up with no configuration. Only set this variable if you need to restrict scanning to specific paths. |
 
 ### Notifications (all optional)
 

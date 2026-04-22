@@ -25,6 +25,19 @@ services:
       - PGID=1000
       - TZ=America/New_York
 
+      # ── Queue & scan settings ────────────────────────────────────────────
+      # POLL_INTERVAL: seconds between queue checks (default: 10)
+      # - POLL_INTERVAL=30
+
+      # RESCAN_INTERVAL: hours between automatic full library rescans (default: disabled)
+      # Catches any files that slipped past the queue hook. 0 = disabled.
+      # - RESCAN_INTERVAL=24
+
+      # MEDIA_DIRS: space-separated list of directories to scan (optional)
+      # By default, every subdirectory of /home/imports is discovered automatically.
+      # Only set this to restrict scanning to specific directories.
+      # - MEDIA_DIRS=/home/imports/movies /home/imports/shows /home/imports/4k
+
       # ── Notifications ────────────────────────────────────────────────────
       # Set NOTIFY_SERVICE to: ntfy | gotify | telegram | discord | email | apprise
       # Leave unset or blank to disable notifications entirely.
@@ -62,9 +75,12 @@ services:
       - /path/to/config/dovi-converter/scripts:/scripts
       # Shared queue — Radarr/Sonarr write job files here
       - /path/to/config/dovi-converter/queue:/home/queue
-      # Media directories — adjust to match your setup
+      # Media directories — bind any number of directories under /home/imports
+      # and they will be discovered automatically. Add as many as you need.
       - /path/to/media/Movies:/home/imports/movies
       - /path/to/media/Shows:/home/imports/shows
+      # - /path/to/media/4K:/home/imports/4k
+      # - /path/to/media/Anime:/home/imports/anime
     restart: unless-stopped
 
   # ── Radarr ──────────────────────────────────────────────────────────────────
