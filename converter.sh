@@ -51,6 +51,19 @@ readonly IMPORTS_ROOT="/home/imports"
 POLL_INTERVAL="${POLL_INTERVAL:-10}"
 RESCAN_INTERVAL="${RESCAN_INTERVAL:-0}"  # hours; 0 = disabled
 
+# DELETE_UNSUPPORTED_PROFILES — when true, files using DoVi profiles that
+# cannot be safely converted (4, 5) will be DELETED rather than left in place.
+# This causes Radarr/Sonarr to re-download the content, ideally picking up
+# a Profile 7/8 release on the second attempt if you have custom formats
+# configured to prefer compatible profiles.
+#
+# Accepts: true | false   (default: false)
+#
+# Use with caution — this permanently deletes media files.
+# Set to true only if you have Radarr/Sonarr configured to prevent Profile 5
+# from being re-downloaded (see README for custom format setup).
+DELETE_UNSUPPORTED_PROFILES="${DELETE_UNSUPPORTED_PROFILES:-false}"
+
 # ── notification configuration ────────────────────────────────────────────────
 # Configure via environment variables in docker-compose.yml.
 # Set NOTIFY_SERVICE to the provider you want, then fill in its variables.
@@ -267,17 +280,10 @@ check_deps() {
 }
 
 # ── detect DoVi ───────────────────────────────────────────────────────────────
+# Returns 0 if file contains DoVi metadata, 1 otherwise.
 has_dovi() {
     local file="$1"
-    # Two complementary checks covering different ffprobe output formats:
-    #   1. Text output: "DOVI configuration record" appears in the human-readable
-    #      stream summary and is the most reliable indicator across ffprobe versions.
-    #   2. JSON output: catches dv_bl_signal_compatibility_id and other structured
-    #      DoVi codec tags that only appear in JSON format.
-    # stderr is merged with stdout on both calls since ffprobe occasionally
-    # prints codec side-data information there.
-    ffprobe -v quiet -show_streams -select_streams v:0 \
-        "$file" 2>&1 \
+    ffprobe -v quiet -show_streams -select_streams v:0 "$file" 2>&1 \
         | grep -qi "DOVI configuration\|dv_profile" \
         && return 0
     ffprobe -v quiet -show_streams -select_streams v:0 \
@@ -285,6 +291,37 @@ has_dovi() {
         | grep -qi "dv_bl_signal_compatibility_id\|dolby.vision" \
         && return 0
     return 1
+}
+
+# ── detect DoVi profile ──────────────────────────────────────────────────────
+# Returns the DoVi profile number (4, 5, 7, 8) or empty string if unknown.
+# Profile 5 is NOT HDR10-compatible and must be skipped — stripping it produces
+# washed-out, green/purple-tinted video because the base layer uses IPT-PQ-C2
+# color space which is meaningless without the DoVi metadata.
+# Profiles 7 and 8 have a proper HDR10-compatible base layer and are safe to strip.
+get_dovi_profile() {
+    local file="$1"
+    local profile
+
+    # Try mkvmerge --identify first — its JSON output reliably contains
+    # the DOVI configuration record with the profile number.
+    profile=$(mkvmerge --identify --identification-format json "$file" 2>/dev/null \
+        | grep -oE '"dv_profile"[[:space:]]*:[[:space:]]*[0-9]+' \
+        | grep -oE '[0-9]+$' \
+        | head -1)
+
+    if [[ -n "$profile" ]]; then
+        echo "$profile"
+        return 0
+    fi
+
+    # Fallback: parse ffprobe text output for "DOVI configuration record: ... profile: N"
+    profile=$(ffprobe -v quiet -show_streams -select_streams v:0 "$file" 2>&1 \
+        | grep -oE 'profile:[[:space:]]*[0-9]+' \
+        | grep -oE '[0-9]+$' \
+        | head -1)
+
+    echo "${profile:-}"
 }
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -568,7 +605,57 @@ process_file() {
         return 0
     fi
 
-    log "DoVi detected: $base"
+    # Check DoVi profile — Profile 5 is NOT HDR10-compatible and must not be
+    # stripped. Stripping Profile 5 produces washed-out, green/purple-tinted
+    # video. Files without a detectable HDR10-compatible base layer are
+    # blocklisted so they are not damaged on future runs.
+    local dovi_profile
+    dovi_profile=$(get_dovi_profile "$input")
+
+    # Only profiles 7 and 8 have a valid HDR10 base layer.
+    # Profile 4 and 5 use IPT-PQ-C2 colour encoding and cannot be safely stripped.
+    # An unknown profile is treated as unsafe — better to leave the file untouched
+    # than risk producing broken colours.
+    case "$dovi_profile" in
+        7|8)
+            : # safe to strip, fall through to conversion below
+            ;;
+        4|5)
+            log_err "Profile $dovi_profile DoVi detected — NOT HDR10-compatible, cannot strip: $base"
+            log_err "  Profile $dovi_profile files use IPT-PQ-C2 colour encoding that requires"
+            log_err "  the DoVi metadata to render correctly."
+
+            if [[ "${DELETE_UNSUPPORTED_PROFILES,,}" == "true" ]]; then
+                log_err "  DELETE_UNSUPPORTED_PROFILES=true — deleting file so Radarr/Sonarr re-downloads."
+                if rm -f "$input"; then
+                    log "Deleted: $input"
+                    notify "DoVi Profile $dovi_profile deleted" "$base — file removed so Radarr/Sonarr will re-download" "high"
+                else
+                    log_err "Failed to delete file: $input"
+                    echo "$input" >> "$BLOCKLIST"
+                    notify "DoVi Profile $dovi_profile delete failed" "$base" "high"
+                fi
+            else
+                log_err "  Re-download from a different source (BluRay rip, non-Netflix WEB-DL,"
+                log_err "  or Profile 7/8 release), or set DELETE_UNSUPPORTED_PROFILES=true to"
+                log_err "  auto-delete and trigger a re-download via Radarr/Sonarr."
+                echo "$input" >> "$BLOCKLIST"
+                log_err "Added to blocklist: $base"
+                notify "DoVi Profile $dovi_profile skipped" "$base (not HDR10-compatible)" "high"
+            fi
+            return 0
+            ;;
+        *)
+            log_err "Unknown or unsupported DoVi profile '${dovi_profile:-none detected}' on: $base"
+            log_err "  Leaving file untouched as a precaution."
+            echo "$input" >> "$BLOCKLIST"
+            log_err "Added to blocklist: $base"
+            notify "DoVi profile unknown" "$base — skipped as a precaution" "high"
+            return 0
+            ;;
+    esac
+
+    log "DoVi detected (profile ${dovi_profile:-unknown}): $base"
     notify "DoVi conversion started" "$base" "default"
 
     if strip_single "$input"; then
@@ -719,6 +806,11 @@ main() {
         log "  Rescan interval : every ${RESCAN_INTERVAL}h"
     else
         log "  Rescan interval : disabled"
+    fi
+    if [[ "${DELETE_UNSUPPORTED_PROFILES,,}" == "true" ]]; then
+        log "  Profile 4/5     : DELETE (will trigger Radarr/Sonarr re-download)"
+    else
+        log "  Profile 4/5     : skip & blocklist (safe default)"
     fi
     if [[ -n "${MEDIA_DIRS:-}" ]]; then
         log "  Media dirs      : ${MEDIA_DIRS} (from MEDIA_DIRS env var)"
